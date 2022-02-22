@@ -1,4 +1,4 @@
-# An Exploration of Heroin Overdose and its Spread Across America
+# An Exploration of Heroin Overdose and its Spread Across America [![Binder](https://mybinder.org/badge_logo.svg)](https://mybinder.org/v2/gh/t-andrew-do/heroin-eda-demo/main?labpath=eda.ipynb)
 
 This repository contains preliminary work on modeling spatialtemporal trends of opioid-related deaths in America.
 
