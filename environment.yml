@@ -4,9 +4,8 @@ channels:
   - r
   - defaults
 dependencies:
-  - python>=3.9
+  - python
   - jupyter
-  - jupyter-book
   - numpy
   - pandas
   - seaborn
@@ -15,11 +14,6 @@ dependencies:
   - scipy
   - openjdk
   - lxml
-  - r-base>=4.1
-  - r-essentials
-  - r-tidyverse
-  - r-gridExtra
-  - r-moments
   - pip
   - pip:
     - sodapy
