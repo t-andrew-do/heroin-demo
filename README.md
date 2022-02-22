@@ -1,6 +1,6 @@
 # An Exploration of Heroin Overdose and its Spread Across America
 
-This repository contains prelimnary work on modeling spatialtemporal trends of opioid-related deaths in America.
+This repository contains preliminary work on modeling spatialtemporal trends of opioid-related deaths in America.
 
 ## Main Github
 
