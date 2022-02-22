@@ -1,9 +1,0 @@
-python>=3.9
-jupyter
-numpy
-pandas
-seaborn
-matplotlib
-plotly
-scipy
-lxml
