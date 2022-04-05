@@ -1,0 +1,427 @@
+---
+title: 'Preliminary Modeling: Heroin Overdoses'
+author: "Andrew Do, Angela Song, Khachatur Mirijanyan, Kevin Ouyang"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Dependencies and Global Constants
+```{r, warning=FALSE, message=FALSE}
+library(CARBayesST)
+library(plotly)
+library(tidyverse)
+
+DATA_PATH       <- file.path('data')
+
+TRAINING_YEARS  <- 2006:2017
+VALIDATION_YEAR <- 2018
+TEST_YEAR       <- 2019
+
+TERRITORY_FIPS  <- c('60', '66', '69', '72', '78')
+```
+
+# Data Intake and Processing
+
+## Overdose Data
+
+The main data set containing drug overdose death rates by county.
+
+```{r, message=FALSE}
+overdose <- read_csv(
+    file.path(DATA_PATH, 
+              'NCHS_-_Drug_Poisoning_Mortality_by_County__United_States.csv')
+  ) %>%
+  transmute(
+    year = Year,
+    fips = str_pad(FIPS, width = 5, side = 'left', pad = '0'),
+    county = County,
+    death_rate = `Model-based Death Rate`
+  )
+```
+
+## County Adjacency Matrix
+
+The National Bureau of Economic research provides [a csv containing an edge-list representation](https://data.nber.org/census/geo/county-adjacency/2010/county_adjacency2010.csv) of counties sharing a border.  We filter to exclude FIPS codes demarcating US territories but include the District of Columbia.  The data are transformed to an adjacency matrix `county_adj_matrix`, which we will use to control for spatial autocorrelation in the model below.
+
+```{r, message=FALSE}
+county_adj <- read_csv(
+    file.path(DATA_PATH, 'county_adjacency2010.csv'),
+    col_select = c(fipscounty, fipsneighbor)
+  ) %>% 
+  filter(
+    fipsneighbor != fipscounty,
+    !str_sub(fipscounty, 1, 2) %in% TERRITORY_FIPS
+  ) %>% 
+  arrange(fipscounty, fipsneighbor)
+
+fips <- unique(county_adj$fipscounty)
+county_adj_matrix <- matrix(integer(length(fips)^2), nrow = length(fips),
+                            dimnames = list(fips, fips))
+county_adj_matrix[as.matrix(county_adj)] <- 1L
+```
+
+## Industry Data
+
+The industry concentration data are derived from the County Business Patterns Survey published by the US Census bureau.  In particular, we are looking at the so-called location quotient, which is a ratio of share of employment within a county against the national share.  This statistic gives a measure of specialization within a county.  Work with feature is exploratory and is subject to change.  In particular, we suspect that working directly with the more interpretable share of employment within a county might give similar results.  This sensitivity analysis will come in future work.
+
+```{r, message=FALSE}
+industry_clusters <- c('Coal.Mining_Cluster.LQ')
+has_high_lq <- function(x, p = 0.75) {
+  return(as.numeric(x >= quantile(x[x > 0], probs = p, na.rm = TRUE)))
+}
+industry <- read_csv(file.path(DATA_PATH, 'reduced_ind_conc_data.csv')) %>%
+  mutate(fips = str_pad(region, width = 5, side = 'left', pad = 0)) %>%
+  select(year, fips, all_of(industry_clusters)) %>% 
+  mutate(across(all_of(industry_clusters), has_high_lq, .names = "high_{.col}"))
+```
+
+## Poverty Data
+
+The data come from the Census SAIPE Model, which regresses the number of people in poverty on the number of tax returns with gross incomes falling below the official poverty threshold, the number of SNAP benefits in July of the previous year, the estimated resident population as of July 1, the total number of tax return exemptions, and the Census 2000 estimate of the number of people in poverty (within categories).
+
+```{r, message=FALSE}
+poverty <- arrow::read_parquet(file.path(DATA_PATH, 'Poverty_Data.parquet')) %>%
+  transmute(
+    year = as.numeric(Year),
+    fips = str_pad(`County FIPS Code`, width = 5, side = 'left', pad = '0'),
+    state = `State FIPS`,
+    pov_percent_all = `Poverty Percent, All Ages`,
+    median_income = `Median Household Income`,
+    pov_percent_minors = `Poverty Percent, Age 5-17 in Families`
+  )
+```
+
+## Combined Data
+
+```{r, message=FALSE}
+df <- expand_grid(year = c(TRAINING_YEARS, VALIDATION_YEAR), fips) %>%
+  left_join(overdose, by = c('year', 'fips')) %>%
+  left_join(poverty, by = c('year', 'fips')) %>%
+  left_join(industry, by = c('year', 'fips')) %>%
+  mutate(
+    state = str_sub(fips, 1, 2),
+    masked_death_rate = case_when(year != VALIDATION_YEAR ~ death_rate),
+    # Impute missing industry indicators as 0
+    high_Coal.Mining_Cluster.LQ = replace_na(high_Coal.Mining_Cluster.LQ, 0)
+  ) %>% 
+  group_by(year, state) %>%
+  mutate(
+    # Impute missing poverty rates with yearly mean by state
+    pov_percent_all = replace_na(pov_percent_all, 
+                                 mean(pov_percent_all, na.rm = TRUE)),
+    pov_percent_minors = replace_na(pov_percent_minors, 
+                                 mean(pov_percent_all, na.rm = TRUE)),
+    median_income = replace_na(median_income, 
+                               median(pov_percent_all, na.rm = TRUE)),
+  ) %>% 
+  ungroup() %>% 
+  arrange(year, fips)
+
+head(df)
+```
+
+# Conditional Auto-regressive Bayesian Spatial-temporal Model
+
+We fit the generalized linear mixed model to the data:
+
+\begin{align*}
+Y_{kt} &\sim f(y_{kt} \vert \mu_{kt}, \nu^2)\\
+g(\mu_{kt}) &= \mathbf{x}'_{kt} \mathbf{\beta} + \psi_{kt}\\
+\mathbf{\beta} &\sim N(\mathbf{\mu}_{\beta}, \mathbf{\Sigma}_{\beta})\\
+\psi_{kt} &= \beta_1 + \phi_k + (\alpha + \delta_k) \frac{t - \bar{t}}{N}\\
+\phi_k \vert \mathbf{\phi}_{-k}, \mathbf{W} &\sim N
+  \left(
+  \frac{\rho_{int}\sum_{j=1}^K w_{kj} \phi_j}{\rho_{int}\sum_{j=1}^K w_{kj} + 1 - \rho_{int}},
+  \frac{\tau_{int}^2}{\rho_{int}\sum_{j=1}^K w_{kj} + 1 - \rho_{int}}
+  \right) \\
+\delta_k \vert \mathbf{\delta}_{-k}, \mathbf{W} &\sim N
+  \left(
+  \frac{\rho_{slo}\sum_{j=1}^K w_{kj} \delta_j}{\rho_{slo}\sum_{j=1}^K w_{kj} + 1 - \rho_{slo}},
+  \frac{\tau_{slo}^2}{\rho_{slo}\sum_{j=1}^K w_{kj} + 1 - \rho_{slo}}
+  \right) \\
+\tau_{int}^2, \tau_{slo}^2 &\sim \text{Inverse-Gamma}(a,b) \\
+\rho_{int}, \rho_{slo} &\sim \text{Uniform}(0, 1) \\
+\alpha &\sim N(\mu_{\alpha}, \sigma^2_{\alpha})
+\end{align*}
+
+where
+
+* $k$ indexes the counties
+* $t$ indexes the years
+* $\mathbf{\beta} = (\beta_1, ..., \beta_p)'$ is the vector of $p$ covariates with a multivariate Gaussian prior with hyperparameters mean $\mathbf{\mu}_{\beta}$ and diagonal covariance matrix $\mathbf{\Sigma}_{\beta}$
+* $\psi_{kt}$ is a (set of) latent spatio-temporally autocorrelated random effects for county $k$ and year $t$
+* In this prototype model the link function $g$ is identity, hence we are modeling $Y_{kt} \sim N(\mu_{kt}, \nu^2)$.  However, we hope to further explore using the logit and log link functions for Binomial and Poisson specifications, respectively, in our continued work
+* $W$ is a (weighted) county-adjacency matrix where larger values correspond to areas that are spatially close.  In our model, $w_{ij}=1$ when two counties share a border and is zero otherwise
+* $\bar{t} = (1/N) \sum_{t=1}^N t$, which means the term $t* =(t-\bar{t})/N$ represents a linear time trend running over a centered unit interval
+* $\beta_1 + \phi_k$ is a county-specific intercept and $\alpha + \delta_k$ is a county-specific slope
+* $\phi$ and $\delta$ are mean-centered random effects modelled as spatially correlated by the CAR prior proposed in [Leroux, Lei, and Breslow (2000)](https://link.springer.com/chapter/10.1007/978-1-4612-1284-3_4)
+* $\rho_{int}$ and $\rho_{slo}$ are spatial smoothness parameters given uniform priors
+* $\tau_{int}$ and $\tau_{slo}$ are the random-effect variances and are given a conjugate inverse-gamma prior
+* $a, b, \mu_{\alpha}, \sigma_{\alpha}^2$ are treated as hyper-parameters
+
+## Prototype Modeling
+
+This model is meant to provide us with a benchmark of run-time and direction on building a diagnostics framework.
+
+```{r, cache=TRUE, message=FALSE, results='hide'}
+poverty_coal_model <- ST.CARlinear(
+  masked_death_rate ~ 
+    median_income + 
+    pov_percent_all + 
+    pov_percent_minors +
+    high_Coal.Mining_Cluster.LQ,
+  family = "gaussian", data = df, W = county_adj_matrix,
+  burnin = 5000, n.sample = 10000, thin = 2
+)
+
+df <- df %>% 
+  mutate(
+    fitted = fitted(poverty_coal_model),
+    residuals = death_rate - fitted
+  )
+
+poverty_coal_model$summary.results
+```
+
+## Model Diagnostics
+
+### Average Fitted Residuals
+
+As a sanity check, we see that averaged over time, our training residuals averaged over time within counties hover around 0.
+
+```{r, warning=FALSE}
+counties <- rjson::fromJSON(
+  file = str_glue('https://raw.githubusercontent.com/',
+                  'plotly/datasets/master/geojson-counties-fips.json'))
+plot_ly() %>% 
+  add_trace(
+    data = df %>% 
+      filter(year %in% TRAINING_YEARS) %>% 
+      group_by(fips) %>% 
+      summarise(residuals = mean(residuals, na.rm = TRUE)),
+    type = "choropleth",
+    geojson = counties,
+    locations = ~fips,
+    z = ~residuals,
+    zmin = -4,
+    zmax = 4,
+    colors = "PRGn",
+    marker = list(
+      line = list(width=0)
+    ),
+    colorbar = list(
+      title = "Residual",
+      tickmode = "array",
+      tickvals = -4:4,
+      ticktext = c("<=-4", '-3', '-2', '-1', '0', '1', '2', '3', '>=4')
+    )
+  ) %>% 
+  layout(
+    title = "Average (over time) Training Error", 
+    geo = list(
+      scope = 'usa', 
+      projection = list(type = 'alvers usa')
+    )
+  )
+```
+
+
+### Prediction residuals 2006-2017 on 2018
+
+Our prediction errors, on the other hand, still shows some spatial clustering with clumps of overprediction and underprediction.
+
+```{r, warning=FALSE}
+plot_ly() %>% 
+  add_trace(
+    data = df %>% 
+      filter(year == VALIDATION_YEAR),
+    type = "choropleth",
+    geojson = counties,
+    locations = ~fips,
+    z = ~residuals,
+    zmin = -4,
+    zmax = 4,
+    colors = "PRGn",
+    marker = list(
+      line = list(width=0)
+    ),
+    colorbar = list(
+      title = "Residual",
+      tickmode = "array",
+      tickvals = -4:4,
+      ticktext = c("Underprediction", '-3', '-2', '-1', '0', '1', '2', '3', 'Overprediction')
+    )
+  ) %>% 
+  layout(
+    title = "Validation Errors", 
+    geo = list(
+      scope = 'usa', 
+      projection = list(type = 'alvers usa')
+    )
+  )
+```
+
+### Heteroskedascity of Residuals
+
+The residuals show signs of heteroskedascity, with higher values exhibiting higher errors.  Due to overplotting, we will have to investigate this issue in several ways.
+
+```{r, warning=FALSE}
+p1 <- plot_ly(df %>% filter(year %in% TRAINING_YEARS)) %>% 
+  add_trace(
+    name = "Training",
+    type = "scatter",
+    mode = "markers",
+    x = ~death_rate,
+    y = ~residuals,
+    text = ~str_glue("{fips}: {year}")
+  ) %>% 
+  layout(
+    xaxis = list(title = "Death Rate per 100k"),
+    yaxis = list(title = "Residual")
+  )
+
+p2 <- plot_ly(df %>% filter(year == VALIDATION_YEAR)) %>% 
+  add_trace(
+    name = "Validation",
+    type = "scatter",
+    mode = "markers",
+    x = ~death_rate,
+    y = ~residuals,
+    text = ~fips
+  ) %>% 
+  layout(
+    xaxis = list(title = "Death Rate per 100k"),
+    yaxis = list(title = "Residual")
+  )
+
+subplot(p1, p2, nrows = 2, shareX = TRUE) %>% 
+  layout(title = "Residuals vs. Actual Values")
+```
+
+### Conditional Distributions
+
+We estimate the conditional percentiles of the predictions given the observations.  This shows that overall our model tends to underpredict death rates, which would be undesirable from a public health standpoint since it could lead to undersupplying counties that need help.
+
+```{r, warning=FALSE, message=FALSE, fig.width=10, fig.height=6}
+#' @description Calculates conditional percentiles by binning the data into fixed-
+#'   width strips using the x-values
+#' @param x observations
+#' @param y predictions
+#' @threshold number of observations to be considered stable
+calculate_conditional_quantiles <- function(x, y, n_bins = 10) {
+
+  breaks <- seq(floor(min(x, y)), ceiling(max(x, y)), length = n_bins + 1)
+  labs <- breaks[-length(breaks)] + 0.5*diff(breaks)
+  
+  x_bins <- cut(x, breaks = breaks, include.lowest = TRUE, labels = labs)
+
+  out <- tibble(x_bins = as.numeric(as.character(x_bins)), y) %>%
+    group_by(x_bins) %>% 
+    summarise(
+      length = length(y),
+      quantiles = quantile(y, c(0.1, 0.25, 0.5, 0.75, 0.9)),
+      probs = factor(c(0.1, 0.25, 0.5, 0.75, 0.9), ordered = TRUE)
+    )
+  
+  return(out)
+}
+
+# Conditional distributions
+p1 <- ggplot() +
+  geom_point(
+    aes(death_rate, fitted), 
+    color = "grey20", alpha = 0.05,
+    data = df %>% 
+      mutate(
+        subset = ifelse(year %in% TRAINING_YEARS, "Training", "Validation")
+      )
+  ) +
+  geom_abline(slope = 1, intercept = 1, size = 1.1) +
+  geom_line(
+    aes(x_bins, quantiles, color = probs), size = 1.25,
+    data = df %>%
+      filter(!is.na(death_rate)) %>%
+      group_by(
+        subset = ifelse(year %in% TRAINING_YEARS, "Training", "Validation")
+      ) %>% 
+      summarise(
+        calculate_conditional_quantiles(death_rate, fitted, n_bins = 20)
+      )
+    ) +
+  coord_fixed() + 
+  facet_grid(cols = vars(subset)) + 
+  scale_x_continuous(limits = c(0, 150)) +
+  scale_y_continuous(limits = c(0, 100)) +
+  scale_color_manual(
+    values = c("#e6194B", "#42d4f4", "#911eb4", "#42d4f4", "#e6194B")
+  ) +
+  labs(
+    title = "Conditional Distribution of Fitted Values",
+    x = "Observed Values",
+    y = "Fitted Values",
+    color = "Percentile"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(size = 24),
+    axis.title = element_text(size = 20),
+    axis.text = element_text(size = 16),
+    legend.title = element_text(size = 20),
+    legend.text = element_text(size = 16),
+    strip.text = element_text(size = 20),
+    legend.position = "bottom"
+  )
+
+ggplotly(p1)
+```
+
+Since the percentile estimates for larger death rates are unstable due to the small number of observations that exhibit such extreme rates, we'll take a moment to examine our model's performance on the more "tame" cases.  We see that there are years in the middle that our model does fairly well on, but in the tail years, we underpredict for an alarming number of counties (2016-2018).
+
+```{r, warning=FALSE, message=FALSE, fig.width=12, fig.height=10}
+ggplot() +
+  geom_point(
+    aes(death_rate, fitted), 
+    color = "grey20", alpha = 0.05,
+    data = df
+  ) +
+  geom_abline(slope = 1, intercept = 1, size = 1.1) +
+  geom_line(
+    aes(x_bins, quantiles, color = probs), size = 1.25,
+    data = df %>%
+      filter(!is.na(death_rate)) %>%
+      group_by(
+        year
+      ) %>% 
+      summarise(
+        calculate_conditional_quantiles(death_rate, fitted, n_bins = 20)
+      )
+  ) +
+  coord_fixed() + 
+  facet_wrap(vars(year)) + 
+  scale_x_continuous(limits = c(0, 40)) +
+  scale_y_continuous(limits = c(0, 40)) +
+  scale_color_manual(
+    values = c("#e6194B", "#42d4f4", "#911eb4", "#42d4f4", "#e6194B")
+  ) +
+  labs(
+    title = "Conditional Distribution of Fitted Values",
+    x = "Observed Values",
+    y = "Fitted Values",
+    color = "Percentile"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(size = 24),
+    axis.title = element_text(size = 20),
+    axis.text = element_text(size = 16),
+    legend.title = element_text(size = 20),
+    legend.text = element_text(size = 16),
+    strip.text = element_text(size = 20),
+    legend.position = "bottom"
+  )
+```
+
