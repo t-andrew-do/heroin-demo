@@ -36,3 +36,14 @@ What effect do economic phenomena have in driving opioid outcomes, controlling f
 
 * Data: Must be scraped from CDC web pages. IQVIA Xponent Data not publicly available
 * Description: https://www.cdc.gov/drugoverdose/rxrate-maps/index.html
+
+### County Adjacency File
+
+*https://www.census.gov/programs-surveys/geography/library/reference/county-adjacency-file.html
+	#Download of file, along with documentation, is available at above link
+
+### US SAIPE County Poverty and Median Income Data
+
+* Description: https://www.census.gov/programs-surveys/saipe.html
+* Data: Loaded from individual xls files for each year at SAIPE endpoints 2006-2020
+* Example 2006: 'https://www2.census.gov/programs-surveys/saipe/datasets/2006/2006-state-and-county/est06all.xls'
