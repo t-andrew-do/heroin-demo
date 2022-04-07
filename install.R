@@ -1,5 +1,0 @@
-install.packages("CARBayesST")
-install.packages("plotly")
-install.packages("tidyverse")
-install.packages("arrow")
-install.packages("rjson")
