@@ -2,7 +2,7 @@
 
 This repository contains preliminary work on modeling spatialtemporal trends of opioid-related deaths in America.  
 JupyterLab: [![Binder](https://mybinder.org/badge_logo.svg)](https://mybinder.org/v2/gh/t-andrew-do/heroin-eda-demo/main?labpath=eda.ipynb)  
-RStudio: [![Binder](https://mybinder.org/badge_logo.svg)](https://mybinder.org/v2/gh/t-andrew-do/heroin-eda-demo/main?urlpath=rstudio)
+RStudio: [![Binder](https://mybinder.org/badge_logo.svg)](https://mybinder.org/v2/gh/t-andrew-do/heroin-eda-demo/rstudio-binder?urlpath=rstudio)
 
 
 ## Main Github
